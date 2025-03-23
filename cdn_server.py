@@ -4,8 +4,6 @@ import ssl
 import json
 import threading
 
-certfile="certs/cdn_cert.pem", 
-keyfile="certs/cdn_key.pem"
 
 
 class TCP_Proxy_Server:
@@ -34,7 +32,7 @@ class TCP_Proxy_Server:
         while True:
             client_socket, client_address = self.accept_client_connection()
             print(f"New client connected: {client_address}")
-            threading.Thread(target=self.handle_client, args=(client_socket, client_address)).start()
+            threading.Thread(target=self.handle_client, args=(client_socket, client_address), daemon = True).start()
 
     def accept_client_connection(self):
         client_socket, client_address = self.server_socket.accept()
@@ -65,7 +63,7 @@ class TCP_Proxy_Server:
         origin_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         origin_socket.connect((self.ip_origin, self.port_origin))
         print("Connected")
-        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         try:
             origin_socket = context.wrap_socket(origin_socket, server_side=False)
             print("SSL connection established")
@@ -86,6 +84,7 @@ class TCP_Proxy_Server:
                 break  # End of stream; no more data from source
             print(f"Relaying data: {data}")
             dst_socket.sendall(data)
+
 if __name__ == "__main__":
     proxy = TCP_Proxy_Server("127.0.0.1",4443,"152.3.103.25",443)
     proxy.start()
