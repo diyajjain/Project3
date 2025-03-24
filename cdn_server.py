@@ -37,7 +37,7 @@ class TCP_Proxy_Server:
     def accept_client_connection(self):
         client_socket, client_address = self.server_socket.accept()
         context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-        context.load_cert_chain(certfile="hw3/certs/cdn_cert.pem", keyfile="hw3/certs/cdn_key.pem")
+        context.load_cert_chain(certfile="certs/cdn_cert.pem", keyfile="certs/cdn_key.pem")
         client_socket = context.wrap_socket(client_socket, server_side=True)
         return client_socket, client_address
     
@@ -58,6 +58,7 @@ class TCP_Proxy_Server:
         client_socket.close()
         origin_socket.close()
     
+    
     def connect_to_origin(self):
         # Create a connection to the origin server
         origin_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -65,7 +66,7 @@ class TCP_Proxy_Server:
         print("Connected")
         context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         try:
-            origin_socket = context.wrap_socket(origin_socket, server_side=False)
+            origin_socket = context.wrap_socket(origin_socket, server_hostname="cs.duke.edu")
             print("SSL connection established")
         except ssl.SSLError as e:
             print(f"SSL error: {e}")
