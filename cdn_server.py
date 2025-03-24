@@ -3,6 +3,7 @@ import socket
 import ssl
 import json
 import threading
+import certifi
 
 
 
@@ -36,24 +37,20 @@ class TCP_Proxy_Server:
 
     def accept_client_connection(self):
         client_socket, client_address = self.server_socket.accept()
-        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH,cafile=certifi.where())
+        #context.check_hostname = True
         context.load_cert_chain(certfile="certs/cdn_cert.pem", keyfile="certs/cdn_key.pem")
         client_socket = context.wrap_socket(client_socket, server_side=True)
         return client_socket, client_address
     
     def handle_client(self, client_socket, client_address):
         origin_socket = self.connect_to_origin()
-
-        # Create two threads to relay messages between client and origin
         client_to_origin = threading.Thread(target=self.relay_messages, args=(client_socket, origin_socket))
         origin_to_client = threading.Thread(target=self.relay_messages, args=(origin_socket, client_socket))
         client_to_origin.start()
         origin_to_client.start()
-
-        # Wait for both relay threads to finish before closing the connections
         client_to_origin.join()
         origin_to_client.join()
-
         print(f"Closing connection with {client_address}")
         client_socket.close()
         origin_socket.close()
@@ -64,7 +61,8 @@ class TCP_Proxy_Server:
         origin_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         origin_socket.connect((self.ip_origin, self.port_origin))
         print("Connected")
-        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,cafile=certifi.where())
+        #ck_hostname = True
         try:
             origin_socket = context.wrap_socket(origin_socket, server_hostname="cs.duke.edu")
             print("SSL connection established")
@@ -96,7 +94,8 @@ class HTTPS_Proxy_Server(TCP_Proxy_Server):
     def accept_client_connection(self):
         """ Accepts a TLS client connection. """
         client_socket, client_address = self.server_socket.accept()
-        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH,cafile=certifi.where())
+
         context.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
         tls_client_socket = context.wrap_socket(client_socket, server_side=True)
         return tls_client_socket, client_address
@@ -166,6 +165,11 @@ class HTTPS_Proxy_Server(TCP_Proxy_Server):
             client_socket.close()
             if origin_socket:  # Ensure it was initialized before closing
                 origin_socket.close()
+
+class Persistant_Proxy_Server(HTTPS_Proxy_Server):
+    def handle_client(self, client_socket, client_address):
+        print("dog")
+
 if __name__ == "__main__":
     proxy = HTTPS_Proxy_Server("127.0.0.1",4443,"152.3.103.25",443,"certs/cdn_cert.pem","certs/cdn_key.pem","cs.duke.edu")
     proxy.start()
