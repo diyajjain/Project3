@@ -86,6 +86,86 @@ class TCP_Proxy_Server:
             print(f"Relaying data: {data}")
             dst_socket.sendall(data)
 
+
+class HTTPS_Proxy_Server(TCP_Proxy_Server):
+    def __init__(self, ip_cdn, port_cdn, ip_origin, port_origin, cert_file, key_file, origin_domain):
+        super().__init__(ip_cdn, port_cdn, ip_origin, port_origin)
+        self.certfile = cert_file
+        self.keyfile = key_file
+        self.origin_domain = origin_domain
+    def accept_client_connection(self):
+        """ Accepts a TLS client connection. """
+        client_socket, client_address = self.server_socket.accept()
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        context.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
+        tls_client_socket = context.wrap_socket(client_socket, server_side=True)
+        return tls_client_socket, client_address
+
+    """def connect_to_origin(self):
+        # Establishes a secure TLS connection to the origin server.
+        context = ssl.create_default_context()
+        origin_socket = context.wrap_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM), server_hostname=self.origin_domain)
+        origin_socket.connect((self.origin_domain, 443))
+        return origin_socket"""
+    
+
+    def receive_client_request(self, client_socket):
+        """ Receives an HTTP request from the client. """
+        request_data = b""
+        while b"\r\n\r\n" not in request_data:  # Ensure we read full request
+            chunk = client_socket.recv(4096)
+            if not chunk:
+                break
+            request_data += chunk
+        return request_data
+    def modify_request(self, request_data):
+        """ Modifies the client request to add `Connection: close`. """
+        print("Modifying request...")
+        print("Original request data:")
+        print(request_data)
+        request_lines = request_data.decode("iso-8859-1").split("\r\n")
+        headers = []
+
+        for line in request_lines:
+            if line.lower().startswith("connection:"):
+                continue  # Remove existing Connection header
+            headers.append(line)
+        headers.append("Connection: close")  # Add new Connection header
+        return "\r\n".join(headers).encode("iso-8859-1") + b"\r\n\r\n"
+    def receive_origin_response(self, origin_socket):
+        """ Receives the response from the origin server. """
+        response_data = b""
+        while True:
+            chunk = origin_socket.recv(4096)
+            if not chunk:
+                break
+            response_data += chunk
+        return response_data
+
+    def handle_client(self, client_socket, client_address):
+        """ Handles the client request, forwards it to the origin, and relays the response. """
+        origin_socket = None  # Initialize to None to avoid UnboundLocalError
+
+        try:
+            request_data = self.receive_client_request(client_socket)
+            if not request_data:
+                return
+            print("Original client request:")
+            print(request_data)
+
+            modified_request = self.modify_request(request_data)
+            print("Modified client request:")
+            print(modified_request)
+            origin_socket = self.connect_to_origin()  # Assign before usage
+            origin_socket.sendall(modified_request)
+
+            response_data = self.receive_origin_response(origin_socket)
+            client_socket.sendall(response_data)
+
+        finally:
+            client_socket.close()
+            if origin_socket:  # Ensure it was initialized before closing
+                origin_socket.close()
 if __name__ == "__main__":
-    proxy = TCP_Proxy_Server("127.0.0.1",4443,"152.3.103.25",443)
+    proxy = HTTPS_Proxy_Server("127.0.0.1",4443,"152.3.103.25",443,"certs/cdn_cert.pem","certs/cdn_key.pem","cs.duke.edu")
     proxy.start()
