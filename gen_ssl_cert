@@ -6,11 +6,12 @@ if [ "$#" -ne 2 ] || [ "$1" != "--origin-domain" ]; then
 fi
 
 DOMAIN=$2
+if [ ! -d "certs" ]; then
+    mkdir certs
+fi
 
 openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
     -keyout certs/cdn_key.pem \
     -out certs/cdn_cert.pem \
-    -subj "/C=US/ST=NC/L=Durham/O=Duke University/OU=CS Department/CN=$DOMAIN" \
+    -subj "/CN=$DOMAIN" \
     -addext "subjectAltName=DNS:$DOMAIN"
-
-echo "Certificate generated for $DOMAIN and stored in certs/"
