@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+
+import socket
+import threading
+import ssl
+import http
+import http.client
+import queue
+import os
+import argparse
+
+# new thing for command line - this is what i changed!
+parser = argparse.ArgumentParser("CDN Server")
+parser.add_argument("--cdn-port", type=int, required=True)
+parser.add_argument("--origin-domain", type=str, required=True)
+parser.add_argument("--origin-addr", type=str, default="127.0.0.1")
+parser.add_argument("--origin-port", type=int, default=443)
+args = parser.parse_args()
+
+listen_port = args.cdn_port
+origin_host = args.origin_addr
+if not origin_host:
+    origin_host = args.origin_domain
+origin_port = args.origin_port
+
+# back to original code
+connection_pool = queue.Queue()
+pool_lock = threading.Lock() 
+
+def get_pool_connection(origin_host, origin_port):
+    print("[DEBUG] Checking for available connections in pool...")
+    try:
+        with pool_lock:
+            connection = connection_pool.get_nowait()
+        if not is_open(connection):
+            print("[DEBUG] Connection from pool is closed. Creating a new one...")
+            connection.close()
+            return new_connection(origin_host, origin_port)
+        print("[DEBUG] Reusing an existing connection from pool.")
+        return connection
+    except queue.Empty:
+        print("[DEBUG] No available connections in pool. Creating a new one...")
+        return new_connection(origin_host, origin_port)
+
+def release_connection(connection):
+    with pool_lock:
+        if not connection_pool.full():
+            print("[DEBUG] Returning connection to pool.")
+            connection_pool.put(connection)
+        else:
+            print("[DEBUG] Connection pool full. Closing connection.")
+            connection.close()
+
+def new_connection(origin_host, origin_port):
+    print(f"[DEBUG] Establishing new connection to {origin_host}:{origin_port}...")
+    sock = socket.create_connection((origin_host, origin_port))
+    ssl_sock = ssl.wrap_socket(sock)
+    ssl_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    return ssl_sock
+
+def is_open(connection):
+    if connection is None:
+        print("[DEBUG] Connection is None, returning False")
+        return False
+    try:
+        connection.settimeout(0.1)
+        connection.send(b"")  # Check if socket is writable
+        connection.settimeout(None)
+        return True
+    except (socket.error, ValueError):
+        print("[DEBUG] Connection error detected, returning False")
+        return False
+
+def sender(client_sock, msg, length):
+    sent_count = 0
+    while sent_count < length:
+        bytes_sent = client_sock.send(msg[sent_count:])
+        if bytes_sent == 0:
+            raise RuntimeError("Socket connection broken")
+        sent_count += bytes_sent
+    print(f"[DEBUG] Sent {sent_count} bytes.")
+
+# new receiver code: read header until "\r\n\r\n", parse Content-Length, then read exactly that many bytes from body
+def receiver(client_sock, dummy_length):
+    header_data = b""
+    while b"\r\n\r\n" not in header_data:
+        chunk = client_sock.recv(1024)
+        if not chunk:
+            break
+        header_data += chunk
+    if b"\r\n\r\n" not in header_data:
+        print("[DEBUG] Incomplete header received.")
+        return header_data
+    header, sep, rest = header_data.partition(b"\r\n\r\n")
+    full_header = header + sep
+    headers = parse_headers(full_header)
+    try:
+        cl = int(headers.get("Content-Length", "0"))
+    except ValueError:
+        cl = 0
+    body = rest
+    remaining = cl - len(rest)
+    while remaining > 0:
+        chunk = client_sock.recv(remaining)
+        if not chunk:
+            break
+        body += chunk
+        remaining -= len(chunk)
+    total_received = len(full_header) + len(body)
+    print(f"[DEBUG] Received {total_received} bytes.")
+    return full_header + body
+
+cache = {}
+cache_lock = threading.Lock()
+
+def can_cache(path, headers):
+    if "no-store" in headers.get("Cache-Control", ""):
+        return False
+    ext = os.path.splitext(path.split('?')[0])[1]
+    return ext in ['.html', '.css', '.js']
+
+def parse_headers(response):
+    headers = {}
+    # split only once on double CRLF to get the header section
+    header_section = response.split(b"\r\n\r\n", 1)[0]
+    header_lines = header_section.split(b"\r\n")[1:]
+    for line in header_lines:
+        key, value = line.split(b": ", 1)
+        headers[key.decode('utf-8')] = value.decode('utf-8')
+    return headers
+
+# create a TCP socket and bind to the provided port
+server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+host = ''  # Listen on all interfaces
+server_sock.bind((host, listen_port))
+server_sock.listen(3)
+print(f"[DEBUG] Server listening on port {listen_port}...")
+
+# wrap socket with SSL using generated certificates
+ssl_server_sock = ssl.wrap_socket(
+    server_sock,
+    keyfile="certs/cdn_key.pem",
+    certfile="certs/cdn_cert.pem",
+    server_side=True,
+    ssl_version=ssl.PROTOCOL_TLS
+)
+
+running = True
+
+def handle_client(client_sock, client_addr):
+    print(f"[DEBUG] New client connected: {client_addr}")
+    ssl_client_sock = client_sock
+    ssl_origin_sock = get_pool_connection(origin_host, origin_port)
+
+    while running:
+        print("[DEBUG] Waiting for client request...")
+        client_request = ssl_client_sock.recv(1024)
+        if len(client_request) == 0:
+            print("[DEBUG] Client closed connection.")
+            break
+
+        request_line = client_request.split(b"\r\n")[0]
+        parts = request_line.split(b" ")
+        if len(parts) < 2:
+            print("[DEBUG] Malformed request received. Sending 400 response.")
+            ssl_client_sock.send(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            break
+
+        method, full_path = parts[0], parts[1]
+        path = full_path.split(b"?")[0].decode('utf-8')
+
+        if method != b"GET":
+            print(f"[DEBUG] Unsupported method {method}. Sending 405 response.")
+            ssl_client_sock.send(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+            break
+
+        with cache_lock:
+            cached_response = cache.get(path)
+        if cached_response:
+            print(f"[DEBUG] Cache hit for {path}. Sending cached response.")
+            sender(ssl_client_sock, cached_response, len(cached_response))
+            continue
+        else: 
+            print(f"[DEBUG] Cache miss for {path}. Fetching from origin.")
+
+        # split the client request into nonempty header lines to avoid extra blank lines
+        request_lines = [line for line in client_request.split(b"\r\n") if line]
+        found_connection = False
+        cleaned_lines = []
+        for line in request_lines:
+            if line.lower().startswith(b"connection:"):
+                cleaned_lines.append(b"Connection: keep-alive")
+                found_connection = True
+            else:
+                cleaned_lines.append(line)
+        if not found_connection: 
+            cleaned_lines.append(b"Connection: keep-alive")
+        modified_request = b"\r\n".join(cleaned_lines) + b"\r\n\r\n"
+
+        print(f"[DEBUG] Forwarding request to origin: {path}")
+        sender(ssl_origin_sock, modified_request, len(modified_request))
+        origin_response = receiver(ssl_origin_sock, 2**20)
+
+        if len(origin_response) == 0:
+            print("[DEBUG] No response from origin. Closing connection.")
+
+        headers = parse_headers(origin_response)
+        if can_cache(path, headers):
+            print(f"[DEBUG] Caching response for {path}.")
+            with cache_lock:
+                cache[path] = origin_response
+
+        print(f"[DEBUG] Sending response to client for {path}.")
+        sender(ssl_client_sock, origin_response, len(origin_response))
+
+    ssl_client_sock.close()
+    print(f"[DEBUG] Connection with {client_addr} closed.")
+    release_connection(ssl_origin_sock)
+
+while running:
+    client_sock, client_addr = ssl_server_sock.accept()
+    print(f"[DEBUG] Accepted connection from {client_addr}")
+    thread = threading.Thread(target=handle_client, args=(client_sock, client_addr))
+    thread.start()
+
+ssl_server_sock.close()

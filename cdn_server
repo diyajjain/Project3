@@ -100,7 +100,8 @@ class HTTPS_Proxy_Server(TCP_Proxy_Server):
     def accept_client_connection(self):
         """ Accepts a TLS client connection. """
         client_socket, client_address = self.server_socket.accept()
-        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH,cafile=certifi.where())
+        #context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH,cafile=certifi.where())
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
 
         context.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
         tls_client_socket = context.wrap_socket(client_socket, server_side=True)
@@ -111,8 +112,9 @@ class HTTPS_Proxy_Server(TCP_Proxy_Server):
         origin_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         origin_socket.connect((self.ip_origin, self.port_origin))
         print("Connected")
-        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,cafile=certifi.where())
-        #ck_hostname = True
+        #context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,cafile=certifi.where())
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        #ck_hostname = True     
         try:
             origin_socket = context.wrap_socket(origin_socket, server_hostname=self.origin_domain)
             print("SSL connection established")
@@ -191,70 +193,91 @@ class Persistant_Proxy_Server(HTTPS_Proxy_Server):
         super().__init__(ip_cdn, port_cdn, ip_origin, port_origin,cert_file, key_file, origin_domain)
         self.connection_pool = queue.Queue()
 
+    def log_request(self,client_ip, request_data, response_data):
+        request_line, host = self.parse_request(request_data)
+        status_code, content_length = self.parse_response(response_data)
+
+        # Format: IP \t Request \t Host \t Status Code \t Content Length
+        log_entry = f"{client_ip}\t{request_line}\t{host}\t{status_code}\t{content_length}\n"
+        print(log_entry)
         
     def is_socket_valid(self, sock):
-        #Check if the socket is valid by attempting a non-blocking read.
+        if sock is None:
+            print("[DEBUG] Connection is None, returning False")
+            return False
         try:
             sock.settimeout(0.1)
-            data = sock.recv(1)  # Try reading a byte safely
-            return bool(data)  # If data is received, the socket is open
-        except (OSError, ssl.SSLError, ssl.SSLEOFError):
+            sock.send(b"")  # Check if socket is writable
+            sock.settimeout(None)
+            return True
+        except (socket.error, ValueError):
+            print("[DEBUG] Connection error detected, returning False")
             return False
+        
     def connect_to_origin(self):
-        #Establishes a secure TLS connection to the origin server or reuse an existing one.
-        for _ in range(10):
+        """Establishes a secure TLS connection to the origin server or reuses an existing one."""
+        while not self.connection_pool.empty():
             try:
-                # Try to get an existing connection from the pool with a timeout of 60 seconds
-                origin_socket = self.connection_pool.get(timeout=0.1)
+                origin_socket = self.connection_pool.get_nowait()  # Avoid waiting
                 print("Reusing existing connection to origin server.")
+                
                 if self.is_socket_valid(origin_socket):
                     return origin_socket
+                else:
+                    print("Stale connection found. Discarding and creating a new one.")
+                    origin_socket.close()
             except queue.Empty:
-                print("Connection pool is empty or timed out. Creating new connection.")
-                '''context = ssl.create_default_context()
-                origin_socket = context.wrap_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM), server_hostname=self.origin_domain)
-                origin_socket.connect((self.ip_origin, self.port_origin))
-                print("Success connecting")
-                print(self.is_socket_valid(origin_socket))
-                return origin_socket'''
-                origin_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                origin_socket.connect((self.ip_origin, self.port_origin))
-                print("Connected")
-                context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,cafile=certifi.where())
-                #ck_hostname = True
-                try:
-                    origin_socket = context.wrap_socket(origin_socket, server_hostname="cs.duke.edu")
-                    print("SSL connection established")
-                except ssl.SSLError as e:
-                    print(f"SSL error: {e}")
-                except Exception as e:
-                    print(f"General error: {e}")
-                #origin_socket = context.wrap_socket(origin_socket, server_side=False)
-                print(f"Connected to origin server at {self.ip_origin}:{self.port_origin}")
-                return origin_socket
-            
-        # If no connection is available or timed out, create a new one
-        '''print("creating new connection")
-        context = ssl.create_default_context()
-        origin_socket = context.wrap_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM), server_hostname=self.origin_domain)
-        origin_socket.connect((self.ip_origin, self.port_origin))
-        return origin_socket'''
-        origin_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        origin_socket.connect((self.ip_origin, self.port_origin))
-        print("Connected")
-        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,cafile=certifi.where())
-        #ck_hostname = True
+                break  # Exit loop if no connections are available
+
+        # Create a new connection if no valid ones exist
+        print("Creating new connection to origin server.")
+        origin_socket = socket.create_connection((self.ip_origin, self.port_origin), timeout=5)
+
         try:
-            origin_socket = context.wrap_socket(origin_socket, server_hostname="cs.duke.edu")
+            context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+            origin_socket = context.wrap_socket(origin_socket, server_hostname=self.origin_domain)
             print("SSL connection established")
         except ssl.SSLError as e:
             print(f"SSL error: {e}")
-        except Exception as e:
-            print(f"General error: {e}")
-        #origin_socket = context.wrap_socket(origin_socket, server_side=False)
+            origin_socket.close()
+            return None  # Return None if SSL fails
+
         print(f"Connected to origin server at {self.ip_origin}:{self.port_origin}")
         return origin_socket
     
+    def parse_request(self,request_data):
+        try:
+            request_text = request_data.decode("utf-8")
+            request_lines = request_text.split("\r\n")
+
+            # First line is always the GET request line
+            request_line = request_lines[0]
+
+            # Extract Host header
+            host_line = next((line for line in request_lines if line.lower().startswith("host:")), None)
+            host = host_line.split(": ", 1)[1] if host_line else "Unknown Host"
+
+            return request_line, host
+        except Exception as e:
+            print(f"Error parsing request: {e}")
+            return "ERROR", "Unknown Host"
+        
+    def parse_response(self,response_data):
+        try:
+            response_text = response_data.decode("utf-8")
+            response_lines = response_text.split("\r\n")
+
+            # First line contains the HTTP status
+            status_line = response_lines[0]
+            status_code = status_line.split(" ")[1] if len(status_line.split(" ")) > 1 else "500"
+
+            # Extract Content-Length header
+            content_length = next((line.split(": ")[1] for line in response_lines if line.lower().startswith("content-length:")), "0")
+
+            return status_code, int(content_length)
+        except Exception as e:
+            print(f"Error parsing response: {e}")
+            return "500", 0
 
     def handle_client(self, client_socket, client_address):
         # Handles the client request, forwards it to the origin, and relays the response.
@@ -263,22 +286,25 @@ class Persistant_Proxy_Server(HTTPS_Proxy_Server):
         try:
             request_data = self.receive_client_request(client_socket)
             if not request_data:
+                print("No request data received")
                 return
             print("Original client request:")
-            #print(request_data)
-
-            modified_request = self.modify_request(request_data)
-            print("Modified client request:")
-            #print(modified_request)
+            print(request_data)
             origin_socket = self.connect_to_origin()  # Assign before usage
             print("Connected")
+            modified_request = self.modify_request(request_data)
+            print("Modified client request:")
+            print(modified_request)
             origin_socket.sendall(modified_request)
             #print(f"modified request: {modified_request}")
             print("Sent")
             print(self.is_socket_valid(origin_socket))
             response_data = self.receive_origin_response(origin_socket)
+            #status_code, content_length = self.parse_response(response_data)
             print(f"Response: {response_data}")
             client_socket.sendall(response_data)
+            print("LOGLOGLOGLOGLOG")
+            self.log_request(client_address[0], request_data, response_data)
             if origin_socket and self.is_socket_valid(origin_socket):  # Ensure it was initialized before closing
                 self.connection_pool.put(origin_socket)
             else:
@@ -310,15 +336,16 @@ class Persistant_Proxy_Server(HTTPS_Proxy_Server):
             if not headers_received:
                 headers_end = response_data.find(b"\r\n\r\n")
                 if headers_end != -1:
+                    headers_received == True
                     # Headers are finished, so we can process the headers now
-                    headers = response_data[:headers_end].decode("iso-8859-1")
-                    response_data = response_data[headers_end + 4:]  # Remove headers from the response data
+                    headers = response_data[:headers_end]
+                    body = response_data[headers_end + 4:]  # Remove headers from the response data
                     
                     # Look for Content-Length header
-                    match = re.search(r"Content-Length: (\d+)", headers)
+                    match = re.search(rb"Content-Length: (\d+)", headers)
                     if match:
                         content_length = int(match.group(1))  # Set the content length
-                    headers_received = True
+                    response_data = headers + body
             
             # If the content length is known and we've read enough data, break
             print(f"content length {content_length}")
@@ -340,22 +367,26 @@ class Persistant_Proxy_Server(HTTPS_Proxy_Server):
             if line.lower().startswith("connection:"):
                 connection_header_found = True
                 headers.append("Connection: keep-alive")  # Modify existing header
+            elif line == "":
+                break
             else:
                 headers.append(line)
         if not connection_header_found:
-            headers.append("Connection: keep-alive")    
-        return "\r\n".join(headers).encode("iso-8859-1") + b"\r\n\r\n"
+            headers.insert(1, "Connection: keep-alive")  
+
+        modified_request = "\r\n".join(headers) + "\r\n\r\n"
+        return modified_request.encode("iso-8859-1")
     
-    
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="HTTPS Proxy Server for CDN")
 
     # Define command-line arguments
-    parser.add_argument("--cdn-port", type=int, required=True, help="The port number for the CDN proxy")
+    parser.add_argument("--cdn-port", type=int, required=True, help="The port number for the CDN proxy", )
     parser.add_argument("--origin-domain", type=str, required=True, help="The domain of the origin server")
-    parser.add_argument("--origin-addr", type=str, required=True, help="The IP address of the origin server")
-    parser.add_argument("--origin-port", type=int, required=True, help="The port of the origin server")
+    parser.add_argument("--origin-addr", type=str, required=True, help="The IP address of the origin server", default="127.0.0.1")
+    parser.add_argument("--origin-port", type=int, required=True, help="The port of the origin server", default=443)
 
     # Parse the arguments
     args = parser.parse_args()
@@ -366,5 +397,5 @@ if __name__ == "__main__":
     origin_addr = args.origin_addr
     origin_port = args.origin_port
     
-    proxy = HTTPS_Proxy_Server("127.0.0.1",cdn_port,origin_addr,origin_port,"certs/cdn_cert.pem","certs/cdn_key.pem",origin_domain=origin_domain)
+    proxy = Persistant_Proxy_Server("127.0.0.1",cdn_port,origin_addr,origin_port,"certs/cdn_cert.pem","certs/cdn_key.pem",origin_domain=origin_domain)
     proxy.start()
