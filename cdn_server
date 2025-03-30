@@ -5,7 +5,7 @@ import socket
 import ssl
 import json
 import threading
-import certifi
+#import certifi
 import queue
 import re
 
@@ -28,8 +28,8 @@ class TCP_Proxy_Server:
         #port = self.port_origin
         #self.server_socket.bind(('127.0.0.1', self.port_cdn))
         try:
-            self.server_socket.bind(('127.0.0.1', self.port_cdn))  # Binding to localhost and the port
-            print(f"Proxy server listening on {self.ip_cdn}:{self.port_cdn}")
+            self.server_socket.bind(('', self.port_cdn))  # Binding to localhost and the port
+            #print(f"Proxy server listening on {self.ip_cdn}:{self.port_cdn}")
         except Exception as e:
             print(f"Error binding server socket: {e}")
             return
@@ -42,7 +42,8 @@ class TCP_Proxy_Server:
 
     def accept_client_connection(self):
         client_socket, client_address = self.server_socket.accept()
-        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH,cafile=certifi.where())
+        #context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH,cafile=certifi.where())
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         #context.check_hostname = True
         context.load_cert_chain(certfile="certs/cdn_cert.pem", keyfile="certs/cdn_key.pem")
         client_socket = context.wrap_socket(client_socket, server_side=True)
@@ -66,7 +67,8 @@ class TCP_Proxy_Server:
         origin_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         origin_socket.connect((self.ip_origin, self.port_origin))
         print("Connected")
-        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,cafile=certifi.where())
+        #context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,cafile=certifi.where())
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         #ck_hostname = True
         try:
             origin_socket = context.wrap_socket(origin_socket, server_hostname="cs.duke.edu")
@@ -262,14 +264,18 @@ class Persistant_Proxy_Server(HTTPS_Proxy_Server):
             print(f"Error parsing request: {e}")
             return "ERROR", "Unknown Host"
         
-    def parse_response(self,response_data):
+    def parse_response(self, response_data):
         try:
             response_text = response_data.decode("utf-8")
             response_lines = response_text.split("\r\n")
 
-            # First line contains the HTTP status
-            status_line = response_lines[0]
-            status_code = status_line.split(" ")[1] if len(status_line.split(" ")) > 1 else "500"
+            # Find the status line that starts with "HTTP/"
+            status_line = next((line for line in response_lines if line.startswith("HTTP/")), None)
+
+            if status_line:
+                status_code = status_line.split(" ")[1] if len(status_line.split(" ")) > 1 else "500"
+            else:
+                status_code = "500"  # Default to 500 if no valid status line found
 
             # Extract Content-Length header
             content_length = next((line.split(": ")[1] for line in response_lines if line.lower().startswith("content-length:")), "0")
@@ -278,6 +284,15 @@ class Persistant_Proxy_Server(HTTPS_Proxy_Server):
         except Exception as e:
             print(f"Error parsing response: {e}")
             return "500", 0
+        
+    def sender(self, client_sock, msg, length):
+        sent_count = 0
+        while sent_count < length:
+            bytes_sent = client_sock.send(msg[sent_count:])
+            if bytes_sent == 0:
+                raise RuntimeError("Socket connection broken")
+            sent_count += bytes_sent
+        print(f"[DEBUG] Sent {sent_count} bytes.")
 
     def handle_client(self, client_socket, client_address):
         # Handles the client request, forwards it to the origin, and relays the response.
@@ -296,13 +311,14 @@ class Persistant_Proxy_Server(HTTPS_Proxy_Server):
             print("Modified client request:")
             print(modified_request)
             origin_socket.sendall(modified_request)
-            #print(f"modified request: {modified_request}")
             print("Sent")
             print(self.is_socket_valid(origin_socket))
             response_data = self.receive_origin_response(origin_socket)
-            #status_code, content_length = self.parse_response(response_data)
             print(f"Response: {response_data}")
-            client_socket.sendall(response_data)
+            try:
+                self.sender(client_socket,response_data,len(response_data))
+            except Exception as e:
+                print(f"Error sending data to client: {e}")
             print("LOGLOGLOGLOGLOG")
             self.log_request(client_address[0], request_data, response_data)
             if origin_socket and self.is_socket_valid(origin_socket):  # Ensure it was initialized before closing
@@ -336,20 +352,28 @@ class Persistant_Proxy_Server(HTTPS_Proxy_Server):
             if not headers_received:
                 headers_end = response_data.find(b"\r\n\r\n")
                 if headers_end != -1:
-                    headers_received == True
+                    headers_received = True
                     # Headers are finished, so we can process the headers now
                     headers = response_data[:headers_end]
-                    body = response_data[headers_end + 4:]  # Remove headers from the response data
+                    #body = response_data[headers_end + 4:]  # Remove headers from the response data
                     
                     # Look for Content-Length header
                     match = re.search(rb"Content-Length: (\d+)", headers)
                     if match:
                         content_length = int(match.group(1))  # Set the content length
-                    response_data = headers + body
+                    else:
+                        raise ValueError("Content-Length header not found.")
+                    #if content_length is not None:
+                    #    response_data = headers + body
             
             # If the content length is known and we've read enough data, break
             print(f"content length {content_length}")
-            if content_length is not None and len(response_data) >= content_length:
+            #if content_length is not None and len(response_data) >= content_length:
+            #    break
+            if headers_received and content_length is not None:
+            # Total expected = headers length + CRLF (4 bytes) + body length (content_length)
+                total_expected = response_data.find(b"\r\n\r\n") + 4 + content_length
+            if len(response_data) >= total_expected:
                 break
 
         return response_data
@@ -376,6 +400,19 @@ class Persistant_Proxy_Server(HTTPS_Proxy_Server):
 
         modified_request = "\r\n".join(headers) + "\r\n\r\n"
         return modified_request.encode("iso-8859-1")
+    def accept_client_connection(self):
+        client_socket, client_address = self.server_socket.accept()
+        #context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH,cafile=certifi.where())
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        context.check_hostname = False
+        context.load_cert_chain(certfile="certs/cdn_cert.pem", keyfile="certs/cdn_key.pem")
+        try:
+            client_socket = context.wrap_socket(client_socket, server_side=True)
+        except ssl.SSLError as e:
+            print(f"SSL Error: {e}")
+            client_socket.close()
+            return None, None
+        return client_socket, client_address
     
 
 
