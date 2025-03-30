@@ -414,6 +414,133 @@ class Persistant_Proxy_Server(HTTPS_Proxy_Server):
             return None, None
         return client_socket, client_address
     
+class Caching_Proxy_Server(Persistant_Proxy_Server):
+    def __init__(self, ip_cdn, port_cdn, ip_origin, port_origin, cert_file, key_file, origin_domain, ignore_query_string=False):
+        # Call the parent constructor
+        super().__init__(ip_cdn, port_cdn, ip_origin, port_origin, cert_file, key_file, origin_domain)
+        self.ignore_query_string = ignore_query_string
+        # Use a dictionary for caching; wrap it with a lock for thread safety.
+        self.cache = {}
+        self.cache_lock = threading.Lock()    
+
+    def handle_client(self, client_socket, client_address):
+    # Handles the client request, forwards it to the origin, and relays the response.
+        origin_socket = None  # Initialize to None to avoid UnboundLocalError
+
+        try:
+            request_data = self.receive_client_request(client_socket)
+            if not request_data:
+                print("No request data received")
+                return
+            print("Original client request:")
+            print(request_data)
+
+            # Parse the request line to extract the method and path.
+            try:
+                request_text = request_data.decode("utf-8", errors="replace")
+                request_line = request_text.split("\r\n")[0]
+                parts = request_line.split(" ")
+                if len(parts) < 2:
+                    print("Malformed request")
+                    return
+                method = parts[0].upper()
+                full_path = parts[1]
+            except Exception as e:
+                print(f"Error parsing request line: {e}")
+                return
+
+            # For GET requests, derive cache key and check cache.
+            cache_key = None
+            if method == "GET":
+                if self.ignore_query_string:
+                    cache_key = full_path.split("?")[0]
+                else:
+                    cache_key = full_path
+                cached_response = self.cache_get(cache_key)
+                if cached_response:
+                    print(f"[CACHE] Hit for {cache_key}")
+                    try:
+                        self.sender(client_socket, cached_response, len(cached_response))
+                    except Exception as e:
+                        print(f"Error sending cached data to client: {e}")
+                    return
+                else:
+                    print(f"[CACHE] Miss for {cache_key}")
+
+            origin_socket = self.connect_to_origin()  # Assign before usage
+            print("Connected")
+            modified_request = self.modify_request(request_data)
+            print("Modified client request:")
+            print(modified_request)
+            origin_socket.sendall(modified_request)
+            print("Sent")
+            print(self.is_socket_valid(origin_socket))
+            response_data = self.receive_origin_response(origin_socket)
+            print(f"Response: {response_data}")
+            try:
+                self.sender(client_socket, response_data, len(response_data))
+            except Exception as e:
+                print(f"Error sending data to client: {e}")
+            print("LOGLOGLOGLOGLOG")
+            self.log_request(client_address[0], request_data, response_data)
+
+            # If the method is GET, check if the response is cacheable and store it.
+            if method == "GET" and cache_key is not None:
+                # Extract header section (assumes headers and body are separated by \r\n\r\n)
+                header_section = response_data.split(b"\r\n\r\n", 1)[0].decode("utf-8", errors="replace")
+                headers = self.parse_response_headers(header_section)
+                if self.is_cacheable(full_path, headers):
+                    self.cache_put(cache_key, response_data)
+
+            if origin_socket and self.is_socket_valid(origin_socket):  # Ensure it was initialized before closing
+                self.connection_pool.put(origin_socket)
+            else:
+                origin_socket.close()
+
+        except Exception as e:
+            print(f"Error handling client {client_address} : {e}")
+        finally:
+            client_socket.close()
+
+    def cache_get(self, path):
+        with self.cache_lock:
+            return self.cache.get(path)
+
+    def cache_put(self, path, response_data):
+        with self.cache_lock:
+            self.cache[path] = response_data
+            print(f"[CACHE] Stored response for {path}")
+
+    def is_cacheable(self, path, headers):
+        # Check if the response should not be cached based on Cache-Control
+        cache_control = headers.get("Cache-Control", "").lower()
+        if "no-store" in cache_control:
+            return False
+
+        # Derive the file extension (special handling for "/" can be added)
+        import os
+        # Remove query string if present
+        path_only = path.split("?")[0]
+        ext = os.path.splitext(path_only)[1]
+        # Cache only common static content (adjust the list as needed)
+        if ext in ['.html', '.css', '.js']:
+            return True
+        # Optionally, treat "/" as cacheable
+        if path_only == "/":
+            return True
+        return False
+
+    def parse_response_headers(self, header_str):
+        """
+        Given a string containing the HTTP response headers, parse them into a dictionary.
+        """
+        headers = {}
+        lines = header_str.split("\r\n")
+        for line in lines[1:]:  # skip the status line
+            if ": " in line:
+                key, value = line.split(": ", 1)
+                headers[key] = value
+        return headers
 
 
 if __name__ == "__main__":
@@ -434,5 +561,5 @@ if __name__ == "__main__":
     origin_addr = args.origin_addr
     origin_port = args.origin_port
     
-    proxy = Persistant_Proxy_Server("127.0.0.1",cdn_port,origin_addr,origin_port,"certs/cdn_cert.pem","certs/cdn_key.pem",origin_domain=origin_domain)
+    proxy = Caching_Proxy_Server("127.0.0.1",cdn_port,origin_addr,origin_port,"certs/cdn_cert.pem","certs/cdn_key.pem",origin_domain=origin_domain)
     proxy.start()
